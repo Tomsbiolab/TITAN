@@ -7,14 +7,14 @@ nextflow.enable.dsl=2
  * --------------------------------------------------- */
 
 process SRA_DOWNLOAD {
-    tag "$sra_id"
+    tag "$group_id:$sra_id"
     publishDir "${params.outdir}/raw_reads", mode: 'copy'
 
     input:
-    val sra_id
+    tuple val(group_id), val(sra_id)
 
     output:
-    tuple val(sra_id), path("*.fastq")
+    tuple val(group_id), val(sra_id), path("*.fastq")
 
     script:
     """
@@ -25,21 +25,21 @@ process SRA_DOWNLOAD {
 }
 
 process FASTP {
-    tag "$sample_id"
+    tag "$group_id:$sample_id"
     publishDir "${params.outdir}/fastp_reports", mode: 'copy', pattern: "*.{html,json}"
 
     input:
-    tuple val(sample_id), path(reads)
+    tuple val(group_id), val(sample_id), path(reads)
 
     output:
-    tuple val(sample_id), path("*_trim.fq.gz"), emit: trimmed_reads
+    tuple val(group_id), val(sample_id), path("*_trim.fq.gz"), emit: trimmed_reads
     path "*.html"
     path "*.json"
 
     script:
     // Groovy dynamically checks if input is a single file (SE) or a list (PE)
     def is_paired = reads instanceof List || reads.getClass().isArray() ? true : false
-    
+
     if (is_paired) {
         """
         fastp \
@@ -88,17 +88,17 @@ process STAR_INDEX {
 }
 
 process STAR_ALIGN {
-    tag "$sample_id"
+    tag "$group_id:$sample_id"
     // Copy FASTQ files instead of symlinking to avoid Docker volume
     // sync lag on ext4 external HDDs serving stale data through symlinks
     stageInMode 'copy'
 
     input:
-    tuple val(sample_id), path(reads)
+    tuple val(group_id), val(sample_id), path(reads)
     path star_index
 
     output:
-    tuple val(sample_id), path("*.bam")
+    tuple val(group_id), val(sample_id), path("*.bam")
 
     script:
     """
@@ -126,7 +126,7 @@ process STAR_ALIGN {
             echo "ERROR: \$f does not look like a FASTQ file (first char='\$first_char')." >&2
             exit 1
         fi
-        
+
         # Decompress to disk to avoid STAR's pipe short-read bugs
         uncompressed="\${f%.gz}"
         echo "Decompressing \$f to \$uncompressed ..."
@@ -150,21 +150,20 @@ process STAR_ALIGN {
          --outFilterMismatchNmax 999 \
          --outFilterMismatchNoverLmax 0.04 \
          --outFileNamePrefix ${sample_id}.
-         
+
     # Cleanup uncompressed files to save disk space
     rm -f \$uncompressed_reads
     """
 }
 
 process PROCESS_BAM {
-    tag "$sample_id"
-    publishDir "${params.outdir}/bam", mode: 'copy'
+    tag "$group_id:$sample_id"
 
     input:
-    tuple val(sample_id), path(bam)
+    tuple val(group_id), val(sample_id), path(bam)
 
     output:
-    tuple val(sample_id), path("${sample_id}.filtered.bam")
+    tuple val(group_id), val(sample_id), path("${sample_id}.filtered.bam")
 
     script:
     // Piped samtools commands to drastically save IO operations and disk space
@@ -177,34 +176,83 @@ process PROCESS_BAM {
     """
 }
 
-process ASSEMBLE_STRINGTIE {
-    tag "$sample_id"
+process MERGE_SORT_INDEX_BAM {
+    // Merge all per-sample filtered BAMs that share the same group_id (i.e. the same
+    // input source: one fastq_dir folder or one SRA CSV file) into a single
+    // coordinate-sorted, indexed BAM. samtools merge already does a merge-sort of
+    // coordinate-sorted inputs, so no extra sort pass is needed.
+    tag "$group_id"
 
     input:
-    tuple val(sample_id), path(bam)
+    tuple val(group_id), path(bams)
+
+    output:
+    tuple val(group_id), path("${group_id}.merged.bam"), path("${group_id}.merged.bam.bai")
+
+    script:
+    def bam_list = (bams instanceof List ? bams : [bams]).join(' ')
+    """
+    samtools merge -f -@ ${task.cpus} ${group_id}.merged.bam ${bam_list}
+    samtools index -@ ${task.cpus} ${group_id}.merged.bam
+    """
+}
+
+process ASSEMBLE_STRINGTIE {
+    tag "$group_id"
+    publishDir "${params.outdir}/transcriptomes/stringtie", mode: 'copy'
+
+    input:
+    tuple val(group_id), path(bam)
 
     output:
     path "*_stringtie*.gtf"
 
     script:
     """
-    stringtie -p ${task.cpus} -o ${sample_id}_stringtie_default.gtf ${bam}
-    stringtie -f 0.99 -m 120 -a 15 -j 3 -c 3 -s 4.75 -g 50 -p ${task.cpus} -t -o ${sample_id}_stringtie_morus.gtf ${bam}
+    stringtie -p ${task.cpus} -o ${group_id}_stringtie_default.gtf ${bam}
+    stringtie -f 0.99 -m 120 -a 15 -j 3 -c 3 -s 4.75 -g 50 -p ${task.cpus} -t -o ${group_id}_stringtie_morus.gtf ${bam}
     """
 }
 
 process ASSEMBLE_PSICLASS {
-    tag "$sample_id"
+    tag "$group_id"
+    publishDir "${params.outdir}/transcriptomes/psiclass", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(bam)
+    tuple val(group_id), path(bam)
 
     output:
     path "*_psiclass.gtf_vote.gtf"
 
     script:
     """
-    psiclass -p ${task.cpus} -b ${bam} -o ${sample_id}_psiclass.gtf
+    psiclass -p ${task.cpus} -b ${bam} -o ${group_id}_psiclass.gtf
+    """
+}
+
+/* ---------------------------------------------------
+ * REPEAT MASKING (EDTA)
+ * --------------------------------------------------- */
+
+process RUN_EDTA {
+    tag "edta"
+    publishDir "${params.outdir}/edta", mode: 'copy'
+
+    input:
+    path genome
+
+    output:
+    path "${genome}.mod.MAKER.masked", emit: masked_genome
+
+    script:
+    """
+    EDTA.pl \
+        --genome ${genome} \
+        --species others \
+        --step all \
+        --sensitive 1 \
+        --anno 1 \
+        --threads ${task.cpus}
     """
 }
 
@@ -293,7 +341,7 @@ process RUN_BRAKER {
     def prot_list = proteins instanceof List ? proteins : [proteins]
     def bam_input = bam_list ? "--bam=" + bam_list.join(',') : ""
     def prot_input = prot_list ? "--prot_seq=" + prot_list.join(',') : ""
-    
+
     """
     braker.pl  \
         --genome=${genome}  \
@@ -398,62 +446,88 @@ workflow {
     }
 
     // Core Reference Channels
-    genome_ch        = Channel.fromPath(params.genome, checkIfExists: true)
-    masked_genome_ch = Channel.fromPath(params.masked_genome, checkIfExists: true)
+    genome_ch         = Channel.fromPath(params.genome, checkIfExists: true)
+
+    // Masked genome: run EDTA if not provided, otherwise use the supplied path
+    if (params.masked_genome) {
+        masked_genome_ch = Channel.fromPath(params.masked_genome, checkIfExists: true)
+    } else {
+        log.info "No masked genome provided: Running EDTA to generate one."
+        masked_genome_ch = RUN_EDTA(genome_ch)
+    }
     fasta_dbs_ch      = Channel.fromPath("${params.fasta_databases_dir}/*.{fa,fasta}", checkIfExists: true)
     dedup_proteins_ch = DEDUP_PROTEINS(fasta_dbs_ch)
     diamond_dbs_ch    = MAKE_DIAMOND_DB(dedup_proteins_ch)
     local_ab_initio_ch = params.ab_initio ? Channel.fromPath(params.ab_initio, checkIfExists: true) : Channel.empty()
-    
+
     // 1. Gather Initial Local Annotations (if any)
     local_transcriptomes_ch = params.transcriptome ? Channel.fromPath(params.transcriptome) : Channel.empty()
 
     // 2. Gather RAW reads (SRA and/or Local FASTQ)
+    //    Every item emitted is a 3-tuple: [group_id, sample_id, reads]
+    //    group_id = CSV basename without extension (SRA) or folder basename (FASTQ dir)
     raw_reads_ch = Channel.empty()
 
     if (params.sra_list) {
-        // Read lines from file, ignoring header/blanks. Assuming CSV with SRR on the first column
-        Channel.fromPath(params.sra_list)
-               .splitCsv(sep: '\t', header: true) // adjust if comma separated
-               .map { row -> row.Run } // Assuming column is named 'Run', adjust if needed
-               | SRA_DOWNLOAD
-               | set { sra_reads_ch }
-        raw_reads_ch = raw_reads_ch.mix(sra_reads_ch)
+        // Parse each CSV file and tag every SRR ID with its source CSV basename as group_id.
+        // Reads the file with plain Groovy so the group_id is available inside flatMap.
+        sra_group_runs_ch = Channel.fromPath(params.sra_list)
+            .flatMap { csv_file ->
+                def group_id = csv_file.baseName
+                def lines    = csv_file.readLines()
+                if (!lines) return []
+                def headers  = lines[0].split('\t')*.trim()
+                def run_idx  = headers.indexOf('Run')
+                lines.drop(1)
+                    .findAll { it.trim() }
+                    .collect { line -> [group_id, line.split('\t')[run_idx].trim()] }
+            }
+        // SRA_DOWNLOAD: input [group_id, sra_id] → output [group_id, sra_id, path(*.fastq)]
+        raw_reads_ch = raw_reads_ch.mix(SRA_DOWNLOAD(sra_group_runs_ch))
     }
 
     if (params.fastq_dir) {
-        // Handle both a single string and a list of directories
-        def fastq_patterns = params.fastq_dir instanceof List 
-            ? params.fastq_dir.collect { "${it}/*{1,2}.{fastq,fq}*" }
-            : "${params.fastq_dir}/*{1,2}.{fastq,fq}*"
+        // Build glob patterns for every supplied directory; fromFilePairs handles both PE and SE.
+        // The parent folder name of the first file in each pair becomes the group_id.
+        def fastq_dirs = params.fastq_dir instanceof List ? params.fastq_dir : [params.fastq_dir]
+        def patterns   = fastq_dirs.collect { "${it}/*{1,2}.{fastq,fq}*" }
 
-        // Using fromFilePairs handles both PE (e.g. _1.fq, _2.fq) and SE (-1 size) 
-        Channel.fromFilePairs(fastq_patterns, size: -1)
-               | set { local_fastq_ch }
+        Channel.fromFilePairs(patterns, size: -1)
+            .map { sample_id, reads ->
+                def group_id = reads[0].parent.name
+                [group_id, sample_id, reads]
+            }
+            | set { local_fastq_ch }
         raw_reads_ch = raw_reads_ch.mix(local_fastq_ch)
     }
 
     // 3. Process the Transcriptomic raw data if it exists
     assembled_transcriptomes_ch = Channel.empty()
-    
+
     // Create STAR index automatically (cached if already exists)
     star_idx_ch = STAR_INDEX(genome_ch)
 
     if (params.sra_list || params.fastq_dir) {
-        // Run preprocessing and alignment
+        // Trim → align → filter, propagating group_id through every step
         trimmed_ch  = FASTP(raw_reads_ch).trimmed_reads
         aligned_ch  = STAR_ALIGN(trimmed_ch, star_idx_ch.first())
         filtered_ch = PROCESS_BAM(aligned_ch)
-        
-        // Assemble Transcripts
-        gtfs_stringtie = ASSEMBLE_STRINGTIE(filtered_ch)
-        gtfs_psiclass  = ASSEMBLE_PSICLASS(filtered_ch)
-        
-        // Combine outputs of assemblies
+
+        // Collect per-sample filtered BAMs by group_id, then produce one merged,
+        // sorted, indexed BAM per input source (fastq_dir folder or SRA CSV file).
+        grouped_bams_ch = filtered_ch
+            .map   { group_id, sample_id, bam -> [group_id, bam] }
+            .groupTuple()
+        merged_bams_ch = MERGE_SORT_INDEX_BAM(grouped_bams_ch)
+
+        // Each merged BAM is assembled independently → one GTF set per input source
+        merged_bam_only_ch = merged_bams_ch.map { group_id, bam, bai -> [group_id, bam] }
+        gtfs_stringtie = ASSEMBLE_STRINGTIE(merged_bam_only_ch)
+        gtfs_psiclass  = ASSEMBLE_PSICLASS(merged_bam_only_ch)
         assembled_transcriptomes_ch = gtfs_stringtie.mix(gtfs_psiclass)
-        
-        // Collect BAMs for Braker
-        bams_to_braker_ch = filtered_ch.map { it[1] }.collect()
+
+        // Collect ALL merged BAMs for the single BRAKER execution
+        bams_to_braker_ch = merged_bams_ch.map { group_id, bam, bai -> bam }.collect()
     } else {
         bams_to_braker_ch = Channel.fromPath(params.genome) // Dummy to avoid empty path error
     }
@@ -461,7 +535,7 @@ workflow {
     // 4. Merge All Transcriptomes (Local annotations + Newly Assembled Data)
     all_transcriptomes_ch = local_transcriptomes_ch.mix(assembled_transcriptomes_ch).collect()
 
-    // 5. Run Braker and collect all ab initio annotations
+    // 5. Run BRAKER once with all merged BAMs → single augustus + genemark output
     braker_proteins_ch = MERGE_PROTEINS_FOR_BRAKER(dedup_proteins_ch.collect())
     RUN_BRAKER(
         genome_ch,

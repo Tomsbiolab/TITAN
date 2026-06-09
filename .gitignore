@@ -1,0 +1,10 @@
+# Nextflow files
+work/
+.nextflow/
+.nextflow.log*
+
+# Pipeline output directory
+results/
+
+# Log files
+*.log
