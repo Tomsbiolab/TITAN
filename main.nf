@@ -333,8 +333,8 @@ process RUN_BRAKER {
     path proteins
 
     output:
-    path "braker/augustus.hints.gtf", emit: augustus_gtf
-    path "braker/**/genemark.gtf", emit: genemark_gtf
+    path "braker/**/augustus.hints.gtf", emit: augustus_gtf
+    path "braker/GeneMark-ETP/genemark.gtf", emit: genemark_gtf
 
     script:
     def bam_list = (bams instanceof List ? bams : [bams]).findAll { it.name.endsWith('.bam') }
