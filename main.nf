@@ -231,6 +231,96 @@ process ASSEMBLE_PSICLASS {
 }
 
 /* ---------------------------------------------------
+ * LONG-READ PROCESSES (minimap2 pathway)
+ * --------------------------------------------------- */
+
+process SRA_DOWNLOAD_LONG_READS {
+    tag "$group_id:$sra_id"
+    publishDir "${params.outdir}/raw_long_reads", mode: 'copy'
+
+    input:
+    tuple val(group_id), val(sra_id)
+
+    output:
+    tuple val(group_id), val(sra_id), path("*.fastq")
+
+    script:
+    """
+    # Download SRA — long reads are always single-end
+    prefetch ${sra_id} --max-size 100G
+    fastq-dump ${sra_id}
+    """
+}
+
+process MINIMAP2_ALIGN {
+    tag "$group_id:$sample_id"
+
+    input:
+    tuple val(group_id), val(sample_id), path(reads)
+    path genome
+
+    output:
+    tuple val(group_id), val(sample_id), path("${sample_id}.bam")
+
+    script:
+    def reads_list = (reads instanceof List ? reads : [reads]).join(' ')
+    """
+    minimap2 -a -t ${task.cpus} --secondary=no -x splice ${genome} ${reads_list} \
+        | samtools view -S -@ ${task.cpus} -b -o ${sample_id}.bam -
+    """
+}
+
+process SORT_BAM_LONG_READS {
+    tag "$group_id:$sample_id"
+
+    input:
+    tuple val(group_id), val(sample_id), path(bam)
+
+    output:
+    tuple val(group_id), val(sample_id), path("${sample_id}.sorted.bam")
+
+    script:
+    """
+    samtools sort -@ ${task.cpus} ${bam} -o ${sample_id}.sorted.bam
+    """
+}
+
+process MERGE_SORT_INDEX_BAM_LONG_READS {
+    tag "$group_id"
+
+    input:
+    tuple val(group_id), path(bams)
+
+    output:
+    tuple val(group_id), path("${group_id}.lr_merged.bam"), path("${group_id}.lr_merged.bam.bai")
+
+    script:
+    def bam_list = (bams instanceof List ? bams : [bams]).join(' ')
+    """
+    samtools merge -f -@ ${task.cpus} ${group_id}.lr_merged.bam ${bam_list}
+    samtools index -@ ${task.cpus} ${group_id}.lr_merged.bam
+    """
+}
+
+process ASSEMBLE_STRINGTIE_LONG_READS {
+    tag "$group_id"
+    publishDir "${params.outdir}/transcriptomes/stringtie_long_reads", mode: 'copy'
+
+    input:
+    tuple val(group_id), path(bam)
+
+    output:
+    path "*_stringtie*.gtf"
+
+    script:
+    """
+    stringtie -p ${task.cpus} -L -o ${group_id}_stringtie_lr_default.gtf ${bam}
+    stringtie -f 0.99 -m 120 -a 15 -j 3 -c 3 -s 4.75 -g 50 -p ${task.cpus} -t -L \
+        -o ${group_id}_stringtie_lr_morus.gtf ${bam}
+    """
+}
+
+/* ---------------------------------------------------
  * REPEAT MASKING (EDTA)
  * --------------------------------------------------- */
 
@@ -532,8 +622,61 @@ workflow {
         bams_to_braker_ch = Channel.fromPath(params.genome) // Dummy to avoid empty path error
     }
 
-    // 4. Merge All Transcriptomes (Local annotations + Newly Assembled Data)
-    all_transcriptomes_ch = local_transcriptomes_ch.mix(assembled_transcriptomes_ch).collect()
+    // --- Long-read processing (minimap2 pathway) ---
+    //     Parallel to the short-read path above: SRA/FASTQ → align → sort → merge → StringTie -L
+    //     No trimming, no deduplication, no quality filtering, no BRAKER.
+    lr_raw_reads_ch  = Channel.empty()
+    lr_assembled_ch  = Channel.empty()
+
+    if (params.lr_sra_list) {
+        // Parse each CSV file the same way as short-read SRA lists
+        lr_sra_group_runs_ch = Channel.fromPath(params.lr_sra_list)
+            .flatMap { csv_file ->
+                def group_id = csv_file.baseName
+                def lines    = csv_file.readLines()
+                if (!lines) return []
+                def headers  = lines[0].split('\t')*.trim()
+                def run_idx  = headers.indexOf('Run')
+                lines.drop(1)
+                    .findAll { it.trim() }
+                    .collect { line -> [group_id, line.split('\t')[run_idx].trim()] }
+            }
+        lr_raw_reads_ch = lr_raw_reads_ch.mix(SRA_DOWNLOAD_LONG_READS(lr_sra_group_runs_ch))
+    }
+
+    if (params.lr_fastq_dir) {
+        // Long reads: single files, not paired-end — use a broad glob
+        def lr_dirs    = params.lr_fastq_dir instanceof List ? params.lr_fastq_dir : [params.lr_fastq_dir]
+        def lr_patterns = lr_dirs.collect { "${it}/*.{fastq,fq,fasta,fa}*" }
+        Channel.fromPath(lr_patterns)
+            .map { file ->
+                def group_id  = file.parent.name
+                def sample_id = file.baseName
+                [group_id, sample_id, file]
+            }
+            | set { lr_local_ch }
+        lr_raw_reads_ch = lr_raw_reads_ch.mix(lr_local_ch)
+    }
+
+    if (params.lr_sra_list || params.lr_fastq_dir) {
+        // Align → sort → merge → assemble (no trim, no dedup)
+        lr_aligned_ch = MINIMAP2_ALIGN(lr_raw_reads_ch, genome_ch.first())
+        lr_sorted_ch  = SORT_BAM_LONG_READS(lr_aligned_ch)
+
+        lr_grouped_ch = lr_sorted_ch
+            .map { group_id, sample_id, bam -> [group_id, bam] }
+            .groupTuple()
+        lr_merged_ch  = MERGE_SORT_INDEX_BAM_LONG_READS(lr_grouped_ch)
+
+        lr_bam_only_ch = lr_merged_ch.map { group_id, bam, bai -> [group_id, bam] }
+        lr_assembled_ch = ASSEMBLE_STRINGTIE_LONG_READS(lr_bam_only_ch)
+    }
+
+    // 4. Merge All Transcriptomes (Local annotations + Short-read + Long-read)
+    all_transcriptomes_ch = local_transcriptomes_ch
+        .mix(assembled_transcriptomes_ch)
+        .mix(lr_assembled_ch)
+        .collect()
 
     // 5. Run BRAKER once with all merged BAMs → single augustus + genemark output
     braker_proteins_ch = MERGE_PROTEINS_FOR_BRAKER(dedup_proteins_ch.collect())
