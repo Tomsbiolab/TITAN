@@ -34,9 +34,11 @@ merge.stats.calculate_transcript_masking()
 merge.update()
 merge.overlaps.detect()
 
+BLAST_SOURCE_SUFFIX = '_merged'
+
 print('Adding BLAST results...')
 for blast_file in args.blast_results:
-    source_name = blast_file.replace('_merged.diamond', '')
+    source_name = os.path.splitext(os.path.basename(blast_file))[0]
     print(f"Loading BLAST hits for {source_name}...")
     merge.add_blast_hits(source_name, blast_file)
 
@@ -46,7 +48,10 @@ merge.update()
 merge.export.gff('.', f'merge_overlaps_{args.version}.gff3')
 
 print('Reducing redundancy...')
-priority_sources = args.priority.split(',')
+priority_sources = [
+    src if src.endswith(BLAST_SOURCE_SUFFIX) else f'{src}{BLAST_SOURCE_SUFFIX}'
+    for src in (s.strip() for s in args.priority.split(','))
+]
 merge.redundancy.filter(source_priority=priority_sources)
 
 merge.id   = f'final_annotation_{args.version}_on_genome'

@@ -8,3 +8,10 @@ results/
 
 # Log files
 *.log
+
+# input
+ab_initio_*
+results_*
+nextflow_*.config
+
+test_aegis_redundancy/*

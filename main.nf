@@ -8,7 +8,6 @@ nextflow.enable.dsl=2
 
 process SRA_DOWNLOAD {
     tag "$group_id:$sra_id"
-    publishDir "${params.outdir}/raw_reads", mode: 'copy'
 
     input:
     tuple val(group_id), val(sra_id)
@@ -21,6 +20,10 @@ process SRA_DOWNLOAD {
     # Download SRA and split to fastq
     prefetch ${sra_id} --max-size 100G
     fastq-dump -I --split-files ${sra_id}
+
+    # Remove the prefetched .sra (and its folder): it is dead weight once the
+    # FASTQ files have been extracted and is never used by downstream steps.
+    rm -rf ${sra_id}
     """
 }
 
@@ -236,7 +239,6 @@ process ASSEMBLE_PSICLASS {
 
 process SRA_DOWNLOAD_LONG_READS {
     tag "$group_id:$sra_id"
-    publishDir "${params.outdir}/raw_long_reads", mode: 'copy'
 
     input:
     tuple val(group_id), val(sra_id)
@@ -249,6 +251,10 @@ process SRA_DOWNLOAD_LONG_READS {
     # Download SRA — long reads are always single-end
     prefetch ${sra_id} --max-size 100G
     fastq-dump ${sra_id}
+
+    # Remove the prefetched .sra (and its folder): it is dead weight once the
+    # FASTQ has been extracted and is never used by downstream steps.
+    rm -rf ${sra_id}
     """
 }
 
@@ -260,13 +266,12 @@ process MINIMAP2_ALIGN {
     path genome
 
     output:
-    tuple val(group_id), val(sample_id), path("${sample_id}.bam")
+    tuple val(group_id), val(sample_id), path("${sample_id}.sam")
 
     script:
     def reads_list = (reads instanceof List ? reads : [reads]).join(' ')
     """
-    minimap2 -a -t ${task.cpus} --secondary=no -x splice ${genome} ${reads_list} \
-        | samtools view -S -@ ${task.cpus} -b -o ${sample_id}.bam -
+    minimap2 -a -t ${task.cpus} --secondary=no -x splice ${genome} ${reads_list} -o ${sample_id}.sam
     """
 }
 
@@ -696,8 +701,11 @@ workflow {
         params.version
     )
 
+    // .first() turns the single merged-proteins emission into a value channel so it
+    // is reused for EVERY diamond database, yielding one *_merged.diamond per DB
+    // (Araport11, Viridiplantae, Eudicotyledons) instead of a single result.
     RUN_DIAMOND(
-        AEGIS_MERGE_ANNOTATIONS.out.proteins,
+        AEGIS_MERGE_ANNOTATIONS.out.proteins.first(),
         diamond_dbs_ch
     )
 
